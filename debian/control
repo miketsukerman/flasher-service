@@ -1,0 +1,21 @@
+Source: flasher-service
+Section: admin
+Priority: optional
+Maintainer: flasher-service contributors
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-pip,
+               python3-venv
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: flasher-service
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+         python3 (>= 3.10),
+         python3-pip,
+         python3-venv
+Description: eMMC image flasher service
+ Streams an image from an HTTP URL and flashes it directly to an eMMC
+ block device.  Runs as a systemd service and exposes a REST API.

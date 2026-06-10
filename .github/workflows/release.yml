@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # needed to upload assets to the release
+
+jobs:
+  # -----------------------------------------------------------------------
+  # 1. Run the test suite before building the package
+  # -----------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt httpx pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  # -----------------------------------------------------------------------
+  # 2. Build .deb and attach it to the GitHub Release
+  # -----------------------------------------------------------------------
+  build-deb:
+    name: Build .deb package
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Strip the leading "v" from the tag (v1.2.3 → 1.2.3)
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tools
+        run: sudo apt-get install -y dpkg
+
+      # -----------------------------------------------------------------
+      # Build the package tree
+      # Architecture: all (pure Python; venv is created on the target
+      # by the postinst script so no compiled artefacts are bundled).
+      # -----------------------------------------------------------------
+      - name: Build package directory tree
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PKG_NAME="flasher-service_${VERSION}_all"
+          PKG_DIR="pkg/${PKG_NAME}"
+
+          # Directories
+          install -d "${PKG_DIR}/DEBIAN"
+          install -d "${PKG_DIR}/opt/flasher-service/flasher_service"
+          install -d "${PKG_DIR}/etc/flasher-service"
+          install -d "${PKG_DIR}/lib/systemd/system"
+
+          # Python package source
+          cp -r flasher_service/. \
+            "${PKG_DIR}/opt/flasher-service/flasher_service/"
+          cp requirements.txt "${PKG_DIR}/opt/flasher-service/"
+          cp pyproject.toml   "${PKG_DIR}/opt/flasher-service/"
+
+          # Default config (do not overwrite an existing config)
+          cp flasher-service.env \
+            "${PKG_DIR}/etc/flasher-service/flasher-service.env"
+
+          # systemd unit
+          cp flasher-service.service \
+            "${PKG_DIR}/lib/systemd/system/flasher-service.service"
+
+          # DEBIAN/control
+          cat > "${PKG_DIR}/DEBIAN/control" << EOF
+          Package: flasher-service
+          Version: ${VERSION}
+          Section: admin
+          Priority: optional
+          Architecture: all
+          Depends: python3 (>= 3.10), python3-pip, python3-venv
+          Maintainer: flasher-service contributors
+          Description: eMMC image flasher service
+           Streams an image from an HTTP URL and flashes it directly to an
+           eMMC block device. Runs as a systemd service and exposes a REST API.
+          EOF
+
+          # DEBIAN/conffiles – mark the config as a conffile so dpkg
+          # preserves user edits on upgrade
+          echo "/etc/flasher-service/flasher-service.env" \
+            > "${PKG_DIR}/DEBIAN/conffiles"
+
+          # DEBIAN/postinst – create venv and install Python deps on target
+          cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
+          #!/bin/sh
+          set -e
+          INSTALL_DIR=/opt/flasher-service
+
+          echo "flasher-service: creating Python virtualenv..."
+          python3 -m venv "${INSTALL_DIR}/venv"
+          "${INSTALL_DIR}/venv/bin/pip" install --quiet --upgrade pip
+          "${INSTALL_DIR}/venv/bin/pip" install --quiet \
+            -r "${INSTALL_DIR}/requirements.txt"
+
+          echo "flasher-service: reloading systemd..."
+          if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable flasher-service || true
+          fi
+          POSTINST
+          chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
+
+          # DEBIAN/prerm – stop service before removal
+          cat > "${PKG_DIR}/DEBIAN/prerm" << 'PRERM'
+          #!/bin/sh
+          set -e
+          if [ -d /run/systemd/system ]; then
+            systemctl stop flasher-service || true
+            systemctl disable flasher-service || true
+          fi
+          PRERM
+          chmod 0755 "${PKG_DIR}/DEBIAN/prerm"
+
+          # DEBIAN/postrm – clean up venv on purge
+          cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "purge" ]; then
+            rm -rf /opt/flasher-service/venv
+            rmdir --ignore-fail-on-non-empty /opt/flasher-service || true
+          fi
+          if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+          fi
+          POSTRM
+          chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
+
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+          echo "PKG_DIR=${PKG_DIR}"   >> "$GITHUB_ENV"
+
+      - name: Build .deb
+        run: |
+          dpkg-deb --build --root-owner-group "${PKG_DIR}"
+          DEB_FILE="pkg/${PKG_NAME}.deb"
+          echo "DEB_FILE=${DEB_FILE}" >> "$GITHUB_ENV"
+          dpkg-deb --info  "${DEB_FILE}"
+
+      - name: Upload .deb to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DEB_FILE }}
+          fail_on_unmatched_files: true
