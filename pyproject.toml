@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "flasher-service"
+version = "1.0.0"
+description = "Streams and flashes an image to an eMMC device over HTTP"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22.0"]
+dev  = ["pytest>=8", "httpx"]
+
+[project.scripts]
+flasher-service = "flasher_service.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flasher_service*"]
