@@ -30,5 +30,20 @@ class Config:
     # HTTP connect/read timeout in seconds.
     HTTP_TIMEOUT: int = int(os.environ.get("FLASHER_HTTP_TIMEOUT", "30"))
 
+    # Path to the NXP Universal Update Utility binary.
+    UUU_PATH: str = os.environ.get("FLASHER_UUU_PATH", "uuu")
+
+    # Local working directory used to stage images before invoking uuu.
+    MFG_WORK_DIR: str = os.environ.get("FLASHER_MFG_WORK_DIR", "/tmp/flasher-mfg")
+
+    # Optional USB bus/device path used by uuu -m (e.g. "1:10").
+    MFG_USB_PATH: Optional[str] = os.environ.get("FLASHER_MFG_USB_PATH") or None
+
+    # Timeout for a full uuu operation in seconds.
+    MFG_TIMEOUT: int = int(os.environ.get("FLASHER_MFG_TIMEOUT", "300"))
+
+    # Default uuu -b profile for image flashing.
+    MFG_UUU_PROFILE: str = os.environ.get("FLASHER_MFG_UUU_PROFILE", "emmc_all")
+
 
 settings = Config()
