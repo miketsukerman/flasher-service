@@ -265,3 +265,40 @@ def list_block_devices() -> list:
         except (json.JSONDecodeError, KeyError):
             pass
     return []
+
+
+def list_uuu_usb_devices(uuu_path: str = "uuu") -> List[dict]:
+    """
+    Return parsed devices from `uuu -lsusb`.
+    """
+    try:
+        result = _run([uuu_path, "-lsusb"])
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+
+    devices: List[dict] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "path" not in line.lower():
+            continue
+
+        path_match = re.search(r"path\s+([0-9:./-]+)", line, re.IGNORECASE)
+        vidpid_match = re.search(
+            r"(?:chip|chip_id)\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4})",
+            line,
+            re.IGNORECASE,
+        )
+
+        devices.append(
+            {
+                "path": path_match.group(1) if path_match else None,
+                "chip": vidpid_match.group(1).lower() if vidpid_match else None,
+                "raw": line,
+            }
+        )
+    return devices

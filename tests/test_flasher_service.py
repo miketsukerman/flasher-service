@@ -28,6 +28,10 @@ class TestConfig(unittest.TestCase):
         from flasher_service.config import settings
         self.assertEqual(settings.BIND_PORT, 8080)
         self.assertEqual(settings.CHUNK_SIZE, 4 * 1024 * 1024)
+        self.assertEqual(settings.UUU_PATH, "uuu")
+        self.assertEqual(settings.MFG_WORK_DIR, "/tmp/flasher-mfg")
+        self.assertEqual(settings.MFG_TIMEOUT, 300)
+        self.assertEqual(settings.MFG_UUU_PROFILE, "emmc_all")
 
     def test_api_token_none_when_empty_env(self):
         import importlib
@@ -282,6 +286,22 @@ class TestApiStatus(unittest.TestCase):
         self.assertEqual(resp.json()["phase"], "idle")
 
 
+class TestApiDevices(unittest.TestCase):
+    def setUp(self):
+        from flasher_service.api import app
+        self.client = TestClient(app)
+
+    @patch("flasher_service.api.list_block_devices", return_value=[])
+    @patch("flasher_service.api.list_uuu_usb_devices", return_value=[{"path": "1:10"}])
+    def test_devices_includes_nxp_usb(self, _mock_uuu, _mock_block):
+        resp = self.client.get("/devices")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertIn("devices", payload)
+        self.assertIn("nxp_usb_devices", payload)
+        self.assertEqual(payload["nxp_usb_devices"], [{"path": "1:10"}])
+
+
 class TestApiFlashAuth(unittest.TestCase):
     def setUp(self):
         from flasher_service.api import app
@@ -373,6 +393,60 @@ class TestApiFlashAccepted(unittest.TestCase):
             json={"image_url": "https://example.com/img.bin"},
         )
         self.assertEqual(resp.status_code, 409)
+
+
+@patch("flasher_service.api.run_mfg_flash")
+class TestApiFlashUUU(unittest.TestCase):
+    def setUp(self):
+        from flasher_service.api import app
+        from flasher_service import config
+        from flasher_service.state import flash_manager, FlashStatus
+
+        config.settings.API_TOKEN = None
+        config.settings.UUU_PATH = "uuu"
+        config.settings.MFG_UUU_PROFILE = "emmc_all"
+        config.settings.MFG_WORK_DIR = "/tmp/flasher-mfg-tests"
+        config.settings.MFG_TIMEOUT = 300
+        flash_manager.status = FlashStatus()
+        flash_manager.cancel_flag.clear()
+        self.client = TestClient(app)
+
+    @patch("flasher_service.api.shutil.which", return_value="/usr/bin/uuu")
+    def test_uuu_flash_returns_202(self, _mock_which, mock_mfg):
+        resp = self.client.post(
+            "/flash",
+            json={
+                "image_url": "https://example.com/img.bin",
+                "flash_method": "uuu",
+            },
+        )
+        self.assertEqual(resp.status_code, 202)
+        data = resp.json()
+        self.assertTrue(data["target_device"].startswith("uuu:"))
+        self.assertEqual(data["source_url"], "https://example.com/img.bin")
+
+    @patch("flasher_service.api.shutil.which", return_value=None)
+    def test_uuu_missing_binary_returns_422(self, _mock_which, mock_mfg):
+        resp = self.client.post(
+            "/flash",
+            json={
+                "image_url": "https://example.com/img.bin",
+                "flash_method": "uuu",
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_uuu_args_and_profile_mutually_exclusive(self, mock_mfg):
+        resp = self.client.post(
+            "/flash",
+            json={
+                "image_url": "https://example.com/img.bin",
+                "flash_method": "uuu",
+                "uuu_profile": "emmc_all",
+                "uuu_args": ["-b", "emmc_all", "{image}"],
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
 
 
 class TestApiCancel(unittest.TestCase):
@@ -608,6 +682,256 @@ class TestFlashIntegration(unittest.TestCase):
             self.assertIn("HTTP error", manager.status.last_error)
         finally:
             os.unlink(tmpfile)
+
+
+class TestUUUParsing(unittest.TestCase):
+    def test_parse_uuu_line(self):
+        from flasher_service.mfg_flash import parse_uuu_line
+
+        parsed = parse_uuu_line("1:6    2/ 10 [████████                ] SDP: boot -f imx-boot")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["connection_id"], "1:6")
+        self.assertEqual(parsed["current_step"], 2)
+        self.assertEqual(parsed["total_steps"], 10)
+        self.assertEqual(parsed["description"], "SDP: boot -f imx-boot")
+
+    def test_parse_uuu_line_non_progress(self):
+        from flasher_service.mfg_flash import parse_uuu_line
+
+        self.assertIsNone(parse_uuu_line("Wait for Known USB Device Appear..."))
+        self.assertIsNone(parse_uuu_line(""))
+
+
+class TestUUUDevices(unittest.TestCase):
+    @patch("flasher_service.safety._run")
+    def test_list_uuu_usb_devices(self, mock_run):
+        from flasher_service.safety import list_uuu_usb_devices
+
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="Build in config: /etc/uuu\nPath 1:10 Chip 1fc9:0134\n",
+            stderr="",
+        )
+        devices = list_uuu_usb_devices("uuu")
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["path"], "1:10")
+        self.assertEqual(devices[0]["chip"], "1fc9:0134")
+
+
+class _FakeProc:
+    def __init__(self, output: str, returncode: int = 0):
+        self.stdout = io.StringIO(output)
+        self._returncode = returncode
+        self.pid = 4321
+
+    def poll(self):
+        if self.stdout.tell() >= len(self.stdout.getvalue()):
+            return self._returncode
+        return None
+
+    def wait(self, timeout=None):
+        return self._returncode
+
+    def terminate(self):
+        self._returncode = -15
+
+    def kill(self):
+        self._returncode = -9
+
+
+class TestMfgFlash(unittest.TestCase):
+    def _make_response_mock(self, data: bytes) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.headers = {"Content-Length": str(len(data))}
+
+        def iter_content(chunk_size=1024):
+            for i in range(0, len(data), chunk_size):
+                yield data[i : i + chunk_size]
+
+        resp.iter_content = iter_content
+        return resp
+
+    @patch("flasher_service.mfg_flash.shutil.which", return_value=None)
+    def test_missing_uuu_binary_fails(self, _mock_which):
+        from flasher_service.mfg_flash import run_mfg_flash
+        from flasher_service.state import FlashManager, Phase
+
+        mgr = FlashManager()
+        mgr.start("https://example.com/img.bin", "uuu:auto")
+        run_mfg_flash(
+            manager=mgr,
+            image_url="https://example.com/img.bin",
+            compression="none",
+            expected_sha256=None,
+            expected_uncompressed_size=None,
+            uuu_binary="uuu",
+            uuu_profile="emmc_all",
+            uuu_args=None,
+            mfg_usb_path=None,
+            mfg_work_dir="/tmp/flasher-mfg-test",
+            mfg_timeout=10,
+            reboot_on_success=False,
+        )
+        self.assertEqual(mgr.status.phase, Phase.FAILED)
+        self.assertIn("UUU binary not found", mgr.status.last_error)
+
+    @patch("flasher_service.mfg_flash.subprocess.Popen")
+    @patch("flasher_service.mfg_flash.requests.get")
+    @patch("flasher_service.mfg_flash.shutil.which", return_value="/usr/bin/uuu")
+    @patch("flasher_service.mfg_flash.shutil.disk_usage")
+    def test_sha_mismatch_fails_before_uuu(
+        self, mock_disk_usage, _mock_which, mock_get, mock_popen
+    ):
+        from types import SimpleNamespace
+        from flasher_service.mfg_flash import run_mfg_flash
+        from flasher_service.state import FlashManager, Phase
+
+        data = b"hello-world"
+        mock_get.return_value = self._make_response_mock(data)
+        mock_disk_usage.return_value = SimpleNamespace(total=1000000, used=100, free=900000)
+
+        mgr = FlashManager()
+        mgr.start("https://example.com/img.bin", "uuu:auto")
+        run_mfg_flash(
+            manager=mgr,
+            image_url="https://example.com/img.bin",
+            compression="none",
+            expected_sha256="a" * 64,
+            expected_uncompressed_size=None,
+            uuu_binary="uuu",
+            uuu_profile="emmc_all",
+            uuu_args=None,
+            mfg_usb_path=None,
+            mfg_work_dir="/tmp/flasher-mfg-test",
+            mfg_timeout=10,
+            reboot_on_success=False,
+        )
+        self.assertEqual(mgr.status.phase, Phase.FAILED)
+        self.assertIn("SHA-256 mismatch", mgr.status.last_error)
+        mock_popen.assert_not_called()
+
+    @patch("flasher_service.mfg_flash.os.killpg")
+    @patch("flasher_service.mfg_flash.subprocess.Popen")
+    @patch("flasher_service.mfg_flash.requests.get")
+    @patch("flasher_service.mfg_flash.shutil.which", return_value="/usr/bin/uuu")
+    @patch("flasher_service.mfg_flash.shutil.disk_usage")
+    def test_uuu_nonzero_exit_fails(
+        self,
+        mock_disk_usage,
+        _mock_which,
+        mock_get,
+        mock_popen,
+        _mock_killpg,
+    ):
+        from types import SimpleNamespace
+        from flasher_service.mfg_flash import run_mfg_flash
+        from flasher_service.state import FlashManager, Phase
+
+        data = b"plain-image"
+        mock_get.return_value = self._make_response_mock(data)
+        mock_disk_usage.return_value = SimpleNamespace(total=1000000, used=100, free=900000)
+        mock_popen.return_value = _FakeProc(
+            "1:6    1/ 2 [====] SDP: boot\nError: failed\n",
+            returncode=1,
+        )
+
+        mgr = FlashManager()
+        mgr.start("https://example.com/img.bin", "uuu:auto")
+        run_mfg_flash(
+            manager=mgr,
+            image_url="https://example.com/img.bin",
+            compression="none",
+            expected_sha256=None,
+            expected_uncompressed_size=None,
+            uuu_binary="uuu",
+            uuu_profile="emmc_all",
+            uuu_args=None,
+            mfg_usb_path=None,
+            mfg_work_dir="/tmp/flasher-mfg-test",
+            mfg_timeout=10,
+            reboot_on_success=False,
+        )
+        self.assertEqual(mgr.status.phase, Phase.FAILED)
+        self.assertIn("UUU failed", mgr.status.last_error)
+        self.assertEqual(mgr.status.mfg_step, "SDP: boot")
+        self.assertEqual(mgr.status.mfg_current_step, 1)
+        self.assertEqual(mgr.status.mfg_total_steps, 2)
+
+    @patch("flasher_service.mfg_flash.os.killpg")
+    @patch("flasher_service.mfg_flash.subprocess.Popen")
+    @patch("flasher_service.mfg_flash.requests.get")
+    @patch("flasher_service.mfg_flash.shutil.which", return_value="/usr/bin/uuu")
+    @patch("flasher_service.mfg_flash.shutil.disk_usage")
+    def test_uuu_args_image_substitution(
+        self,
+        mock_disk_usage,
+        _mock_which,
+        mock_get,
+        mock_popen,
+        _mock_killpg,
+    ):
+        from types import SimpleNamespace
+        from flasher_service.mfg_flash import run_mfg_flash
+        from flasher_service.state import FlashManager, Phase
+
+        data = b"plain-image"
+        mock_get.return_value = self._make_response_mock(data)
+        mock_disk_usage.return_value = SimpleNamespace(total=1000000, used=100, free=900000)
+        mock_popen.return_value = _FakeProc("1:6    1/ 1 [====] Done\n", returncode=0)
+
+        mgr = FlashManager()
+        mgr.start("https://example.com/img.bin", "uuu:auto")
+        run_mfg_flash(
+            manager=mgr,
+            image_url="https://example.com/img.bin",
+            compression="none",
+            expected_sha256=None,
+            expected_uncompressed_size=None,
+            uuu_binary="uuu",
+            uuu_profile="emmc_all",
+            uuu_args=["custom_cmd", "{image}", "--verify"],
+            mfg_usb_path="1:10",
+            mfg_work_dir="/tmp/flasher-mfg-test",
+            mfg_timeout=10,
+            reboot_on_success=False,
+        )
+        self.assertEqual(mgr.status.phase, Phase.SUCCESS)
+        invoked = mock_popen.call_args.args[0]
+        self.assertEqual(invoked[0], "/usr/bin/uuu")
+        self.assertEqual(invoked[1:3], ["-m", "1:10"])
+        self.assertNotIn("{image}", " ".join(invoked))
+
+    @patch("flasher_service.mfg_flash.requests.get")
+    @patch("flasher_service.mfg_flash.shutil.which", return_value="/usr/bin/uuu")
+    @patch("flasher_service.mfg_flash.shutil.disk_usage")
+    def test_disk_space_check(self, mock_disk_usage, _mock_which, mock_get):
+        from types import SimpleNamespace
+        from flasher_service.mfg_flash import run_mfg_flash
+        from flasher_service.state import FlashManager, Phase
+
+        data = b"x" * 1000
+        mock_get.return_value = self._make_response_mock(data)
+        mock_disk_usage.return_value = SimpleNamespace(total=2000, used=1000, free=50)
+
+        mgr = FlashManager()
+        mgr.start("https://example.com/img.bin", "uuu:auto")
+        run_mfg_flash(
+            manager=mgr,
+            image_url="https://example.com/img.bin",
+            compression="none",
+            expected_sha256=None,
+            expected_uncompressed_size=None,
+            uuu_binary="uuu",
+            uuu_profile="emmc_all",
+            uuu_args=None,
+            mfg_usb_path=None,
+            mfg_work_dir="/tmp/flasher-mfg-test",
+            mfg_timeout=10,
+            reboot_on_success=False,
+        )
+        self.assertEqual(mgr.status.phase, Phase.FAILED)
+        self.assertIn("Insufficient staging disk space", mgr.status.last_error)
 
 
 if __name__ == "__main__":

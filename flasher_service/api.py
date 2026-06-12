@@ -3,16 +3,18 @@ FastAPI routes for flasher-service.
 """
 
 import logging
+import shutil
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from .config import settings
 from .flash import run_flash
-from .safety import auto_detect_target, list_block_devices
+from .mfg_flash import run_mfg_flash
+from .safety import auto_detect_target, list_block_devices, list_uuu_usb_devices
 from .state import Phase, flash_manager
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,12 @@ app = FastAPI(
     description="Streams and flashes an image to an eMMC device.",
     version="1.0.0",
 )
+
+if shutil.which(settings.UUU_PATH) is None:
+    logger.warning(
+        "UUU binary not found at startup (%s). UUU flash method requests will fail until installed.",
+        settings.UUU_PATH,
+    )
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -58,6 +66,10 @@ class FlashRequest(BaseModel):
     expected_uncompressed_size: Optional[int] = None
     target_device: Optional[str] = None
     reboot_on_success: bool = False
+    flash_method: Literal["direct", "uuu"] = "direct"
+    uuu_profile: Optional[str] = None
+    uuu_args: Optional[list[str]] = None
+    mfg_usb_path: Optional[str] = None
 
     @field_validator("compression")
     @classmethod
@@ -83,6 +95,15 @@ class FlashRequest(BaseModel):
                 raise ValueError("expected_sha256 must be a 64-character hex string")
         return v
 
+    @model_validator(mode="after")
+    def validate_uuu_fields(self):
+        if self.flash_method == "uuu":
+            if self.uuu_args and self.uuu_profile:
+                raise ValueError("uuu_args and uuu_profile are mutually exclusive")
+            if self.uuu_args is not None and len(self.uuu_args) == 0:
+                raise ValueError("uuu_args must not be an empty list")
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -103,7 +124,9 @@ def get_status(_: None = Depends(_require_auth)):
 @app.get("/devices", tags=["system"])
 def get_devices(_: None = Depends(_require_auth)):
     """List block devices detected by lsblk."""
-    return {"devices": list_block_devices()}
+    payload = {"devices": list_block_devices()}
+    payload["nxp_usb_devices"] = list_uuu_usb_devices(settings.UUU_PATH)
+    return payload
 
 
 @app.post("/flash", status_code=status.HTTP_202_ACCEPTED, tags=["flash"])
@@ -128,35 +151,69 @@ def start_flash(req: FlashRequest, _: None = Depends(_require_auth)):
             detail="A flash operation is already in progress",
         )
 
-    # Resolve target device
-    target = req.target_device or settings.TARGET_DEVICE
-    if target is None:
-        target = auto_detect_target()
-    if target is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "Could not auto-detect an eMMC device.  "
-                "Set target_device in the request or FLASHER_TARGET_DEVICE env var."
+    if req.flash_method == "uuu":
+        if shutil.which(settings.UUU_PATH) is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"flash_method='uuu' requested but UUU binary was not found: "
+                    f"{settings.UUU_PATH!r}"
+                ),
+            )
+
+        mfg_usb_path = req.mfg_usb_path or settings.MFG_USB_PATH
+        target = f"uuu:{mfg_usb_path or 'auto'}"
+        flash_manager.start(source_url=req.image_url, target_device=target)
+
+        thread = threading.Thread(
+            target=run_mfg_flash,
+            kwargs=dict(
+                manager=flash_manager,
+                image_url=req.image_url,
+                compression=req.compression or "none",
+                expected_sha256=req.expected_sha256,
+                expected_uncompressed_size=req.expected_uncompressed_size,
+                uuu_binary=settings.UUU_PATH,
+                uuu_profile=req.uuu_profile or settings.MFG_UUU_PROFILE,
+                uuu_args=req.uuu_args,
+                mfg_usb_path=mfg_usb_path,
+                mfg_work_dir=settings.MFG_WORK_DIR,
+                mfg_timeout=settings.MFG_TIMEOUT,
+                reboot_on_success=req.reboot_on_success,
             ),
+            daemon=True,
+            name="flasher-worker-uuu",
         )
+    else:
+        # Resolve target device
+        target = req.target_device or settings.TARGET_DEVICE
+        if target is None:
+            target = auto_detect_target()
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Could not auto-detect an eMMC device.  "
+                    "Set target_device in the request or FLASHER_TARGET_DEVICE env var."
+                ),
+            )
 
-    flash_manager.start(source_url=req.image_url, target_device=target)
+        flash_manager.start(source_url=req.image_url, target_device=target)
 
-    thread = threading.Thread(
-        target=run_flash,
-        kwargs=dict(
-            manager=flash_manager,
-            image_url=req.image_url,
-            compression=req.compression or "none",
-            expected_sha256=req.expected_sha256,
-            expected_uncompressed_size=req.expected_uncompressed_size,
-            target_device=target,
-            reboot_on_success=req.reboot_on_success,
-        ),
-        daemon=True,
-        name="flasher-worker",
-    )
+        thread = threading.Thread(
+            target=run_flash,
+            kwargs=dict(
+                manager=flash_manager,
+                image_url=req.image_url,
+                compression=req.compression or "none",
+                expected_sha256=req.expected_sha256,
+                expected_uncompressed_size=req.expected_uncompressed_size,
+                target_device=target,
+                reboot_on_success=req.reboot_on_success,
+            ),
+            daemon=True,
+            name="flasher-worker",
+        )
     thread.start()
 
     return {

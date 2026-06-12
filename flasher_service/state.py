@@ -11,6 +11,8 @@ class Phase(str, Enum):
     IDLE = "idle"
     DOWNLOADING = "downloading"
     FLASHING = "flashing"
+    MFG_STAGING = "mfg_staging"
+    MFG_FLASHING = "mfg_flashing"
     VERIFYING = "verifying"
     SUCCESS = "success"
     FAILED = "failed"
@@ -36,6 +38,12 @@ class FlashStatus:
 
     # Error / info
     last_error: Optional[str] = None
+
+    # MFG/UUU progress metadata
+    mfg_tool: Optional[str] = None
+    mfg_step: Optional[str] = None
+    mfg_current_step: Optional[int] = None
+    mfg_total_steps: Optional[int] = None
 
     def elapsed(self) -> float:
         if self.start_time is None:
@@ -67,6 +75,10 @@ class FlashStatus:
             "elapsed_seconds": round(self.elapsed(), 2),
             "throughput_bps": round(self.throughput_bps(), 1),
             "last_error": self.last_error,
+            "mfg_tool": self.mfg_tool,
+            "mfg_step": self.mfg_step,
+            "mfg_current_step": self.mfg_current_step,
+            "mfg_total_steps": self.mfg_total_steps,
         }
         pct = self.percent()
         if pct is not None:
@@ -120,7 +132,13 @@ class FlashManager:
     def request_cancel(self) -> bool:
         """Signal the running job to stop. Returns True if a job was active."""
         with self._lock:
-            if self.status.phase in (Phase.DOWNLOADING, Phase.FLASHING, Phase.VERIFYING):
+            if self.status.phase in (
+                Phase.DOWNLOADING,
+                Phase.FLASHING,
+                Phase.MFG_STAGING,
+                Phase.MFG_FLASHING,
+                Phase.VERIFYING,
+            ):
                 self.cancel_flag.set()
                 return True
             return False
