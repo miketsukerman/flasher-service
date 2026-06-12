@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "flasher-service"
-version = "1.0.0"
+version = "1.1.0"
 description = "Streams and flashes an image to an eMMC device over HTTP"
 readme = "README.md"
 license = { file = "LICENSE" }
