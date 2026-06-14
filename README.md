@@ -27,6 +27,10 @@ A production-oriented Python 3 service that streams an image from an HTTP URL an
   - [POST /cancel](#post-cancel)
   - [POST /reboot](#post-reboot)
 - [curl Examples](#curl-examples)
+- [flasher-client CLI](#flasher-client-cli)
+  - [Installation](#cli-installation)
+  - [Global options](#global-options)
+  - [Commands](#commands)
 - [Safety Guarantees](#safety-guarantees)
 - [Integrity Checking](#integrity-checking)
 - [NXP MFG Tools (UUU)](#nxp-mfg-tools-uuu)
@@ -347,6 +351,204 @@ while true; do
   sleep 2
 done
 ```
+
+---
+
+## flasher-client CLI
+
+`flasher-client` is an ergonomic CLI alternative to raw `curl` that wraps every
+service endpoint in a dedicated subcommand.
+
+---
+
+### CLI Installation
+
+Install the client extras alongside (or instead of) the service:
+
+```bash
+pip install ".[client]"          # from the repo
+# or
+pip install "flasher-service[client]"
+```
+
+This installs the `flasher-client` entry point and its dependencies
+(`click`, `httpx`, `rich`).
+
+---
+
+### Global options
+
+All subcommands share these root-level options:
+
+| Option | Env var | Default | Description |
+|---|---|---|---|
+| `--host TEXT` | `FLASHER_HOST` | `localhost` | Service hostname or IP |
+| `--port INT` | `FLASHER_PORT` | `8080` | Service TCP port |
+| `--token TEXT` | `FLASHER_TOKEN` | *(none)* | ****** |
+| `--timeout INT` | `FLASHER_TIMEOUT` | `30` | HTTP timeout (seconds) |
+| `--json` | — | off | Emit raw JSON instead of human-friendly output |
+| `-q / --quiet` | — | off | Suppress all non-error output; use exit code only |
+
+Environment variables are read when the corresponding flag is not supplied.
+
+---
+
+### Commands
+
+#### `flasher-client health`
+
+Liveness check.  Exits `0` when the service reports `{"status": "ok"}`.
+
+```bash
+flasher-client --host board-ip health
+```
+
+**Equivalent curl:**
+```bash
+curl http://board-ip:8080/health
+```
+
+---
+
+#### `flasher-client status [--watch] [--interval N]`
+
+Show the current flash job state.
+
+| Option | Default | Description |
+|---|---|---|
+| `--watch` | off | Poll until a terminal phase is reached |
+| `--interval FLOAT` | `2` | Seconds between polls (with `--watch`) |
+
+Exit codes in `--watch` mode: `0` = success, `1` = failed/cancelled.
+
+```bash
+# One-shot
+flasher-client --host board-ip --token $TOKEN status
+
+# Live progress (blocks until done)
+flasher-client --host board-ip --token $TOKEN status --watch
+```
+
+**Equivalent curl:**
+```bash
+curl -H "Authorization: ******" http://board-ip:8080/status
+```
+
+---
+
+#### `flasher-client devices`
+
+List block devices and NXP USB devices detected by the service.
+
+```bash
+flasher-client --host board-ip --token $TOKEN devices
+```
+
+**Equivalent curl:**
+```bash
+curl -H "Authorization: ******" http://board-ip:8080/devices
+```
+
+---
+
+#### `flasher-client flash IMAGE_URL [OPTIONS]`
+
+Start a flash operation.  Returns immediately (202 Accepted); use
+`--wait` to block until completion.
+
+| Option | Default | Description |
+|---|---|---|
+| `--compression` | `auto` | `none` \| `gzip` \| `xz` \| `zstd` \| `auto` (detect from URL extension) |
+| `--sha256 HEX` | — | Expected SHA-256 of uncompressed image |
+| `--expected-size BYTES` | — | Expected uncompressed byte count |
+| `--device PATH` | — | Target block device override |
+| `--reboot-on-success` | off | Reboot after a successful flash |
+| `--method` | `direct` | `direct` \| `uuu` |
+| `--uuu-profile TEXT` | — | UUU `-b` profile (uuu method) |
+| `--uuu-args TEXT` | — | Custom UUU args; repeatable (uuu method) |
+| `--mfg-usb-path TEXT` | — | UUU USB path override (uuu method) |
+| `--wait` | off | Poll `/status` until terminal phase |
+| `--interval FLOAT` | `2` | Poll interval seconds (with `--wait`) |
+
+Exit codes (with `--wait`): `0` = success, `1` = failed/cancelled, `2` = HTTP error.
+
+```bash
+TOKEN=your-secret-token
+BASE=board-ip
+
+# Flash a raw image (compression auto-detected as 'none')
+flasher-client --host $BASE --token $TOKEN flash http://fileserver/emmc.img
+
+# Flash a gzip image, verify SHA-256, wait for completion
+flasher-client --host $BASE --token $TOKEN flash \
+  http://fileserver/emmc.img.gz \
+  --sha256 abc123...64hex \
+  --expected-size 4294967296 \
+  --wait
+
+# Flash an xz image to an explicit device, reboot on success
+flasher-client --host $BASE --token $TOKEN flash \
+  http://fileserver/emmc.img.xz \
+  --device /dev/mmcblk1 \
+  --reboot-on-success \
+  --wait
+
+# NXP UUU manufacturing-mode flash
+flasher-client --host $BASE --token $TOKEN flash \
+  http://fileserver/imx-image.wic \
+  --method uuu \
+  --uuu-profile emmc_all \
+  --mfg-usb-path 1:10 \
+  --wait
+```
+
+**Equivalent curl:**
+```bash
+curl -X POST http://board-ip:8080/flash \
+  -H "Authorization: ******" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "http://fileserver/emmc.img.gz", "compression": "gzip"}'
+```
+
+---
+
+#### `flasher-client cancel`
+
+Request cancellation of the running flash job.
+
+```bash
+flasher-client --host board-ip --token $TOKEN cancel
+```
+
+**Equivalent curl:**
+```bash
+curl -X POST -H "Authorization: ******" http://board-ip:8080/cancel
+```
+
+---
+
+#### `flasher-client reboot [-y]`
+
+Reboot the target board.  Prompts for confirmation unless `-y` / `--yes` is given.
+
+```bash
+flasher-client --host board-ip --token $TOKEN reboot --yes
+```
+
+**Equivalent curl:**
+```bash
+curl -X POST -H "Authorization: ******" http://board-ip:8080/reboot
+```
+
+---
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Flash ended in `failed` or `cancelled` phase |
+| `2` | HTTP/network error (connection refused, timeout, 4xx, 5xx) |
 
 ---
 
