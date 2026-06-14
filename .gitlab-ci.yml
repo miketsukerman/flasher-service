@@ -1,0 +1,94 @@
+stages:
+  - test
+  - package
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+test:
+  stage: test
+  image: python:3.12
+  script:
+    - pip install -r requirements.txt click httpx rich pytest respx
+    - python -m pytest tests/ -v
+
+build_flasher_client_deb:
+  stage: package
+  image: debian:bookworm-slim
+  needs: ["test"]
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends dpkg
+  script:
+    - |
+      set -euo pipefail
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"
+      else
+        VERSION="0.0.0+git${CI_PIPELINE_IID}"
+      fi
+
+      PKG_NAME="flasher-client_${VERSION}_all"
+      PKG_DIR="pkg/${PKG_NAME}"
+
+      install -d "${PKG_DIR}/DEBIAN"
+      install -d "${PKG_DIR}/opt/flasher-client/flasher_client"
+      install -d "${PKG_DIR}/usr/bin"
+
+      cp -r flasher_client/. "${PKG_DIR}/opt/flasher-client/flasher_client/"
+      cp LICENSE "${PKG_DIR}/opt/flasher-client/"
+      cp pyproject.toml "${PKG_DIR}/opt/flasher-client/"
+
+      cat > "${PKG_DIR}/opt/flasher-client/requirements-client.txt" << 'REQ'
+      click>=8
+      httpx>=0.27
+      rich>=13
+      REQ
+
+      cat > "${PKG_DIR}/usr/bin/flasher-client" << 'BIN'
+      #!/bin/sh
+      exec /opt/flasher-client/venv/bin/python -m flasher_client.cli "$@"
+      BIN
+      chmod 0755 "${PKG_DIR}/usr/bin/flasher-client"
+
+      cat > "${PKG_DIR}/DEBIAN/control" << EOF
+      Package: flasher-client
+      Version: ${VERSION}
+      Section: admin
+      Priority: optional
+      Architecture: all
+      Depends: python3 (>= 3.10), python3-venv
+      Maintainer: flasher-service contributors
+      Description: CLI client for flasher-service
+       Command-line client for flasher-service API with commands for health,
+       status, device discovery, flashing, cancellation, and reboot.
+      EOF
+
+      cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
+      #!/bin/sh
+      set -e
+      INSTALL_DIR=/opt/flasher-client
+
+      python3 -m venv "${INSTALL_DIR}/venv"
+      "${INSTALL_DIR}/venv/bin/pip" install --quiet --upgrade pip
+      "${INSTALL_DIR}/venv/bin/pip" install --quiet -r "${INSTALL_DIR}/requirements-client.txt"
+      POSTINST
+      chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
+
+      cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
+      #!/bin/sh
+      set -e
+      if [ "$1" = "purge" ]; then
+        rm -rf /opt/flasher-client
+      fi
+      POSTRM
+      chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
+
+      dpkg-deb -Zxz --build --root-owner-group "${PKG_DIR}"
+      ls -l "pkg/${PKG_NAME}.deb"
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - pkg/*.deb
